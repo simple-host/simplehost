@@ -1,14 +1,20 @@
+import hashlib
+import ipaddress
 import os
 import re
 import secrets
 import shutil
+import sqlite3
+import tempfile
 import zipfile
+from contextlib import closing
 from pathlib import Path, PurePosixPath
 
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
     abort, send_from_directory, flash
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -25,7 +31,92 @@ ALLOWED_UPLOADS = {".html", ".zip"}
 MAX_ZIP_FILES = 500
 MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024  # 100 MB total extracted size
 
+# ---------------------------------------------------------------------------
+# Per-IP site limit
+# ---------------------------------------------------------------------------
+MAX_SITES_PER_IP = int(os.environ.get("MAX_SITES_PER_IP", 5))
 
+# Behind Render's proxy, request.remote_addr is the proxy's IP unless we trust
+# the forwarded header. Set TRUSTED_PROXIES to the number of proxies in front
+# of the app (Render = 1).
+TRUSTED_PROXIES = int(os.environ.get("TRUSTED_PROXIES", 1))
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=TRUSTED_PROXIES)
+
+# A file (not a folder), so it can never collide with a site slug.
+DB_PATH = UPLOAD_FOLDER / "_sites.db"
+
+
+def get_db() -> sqlite3.Connection:
+    # isolation_level=None -> we control transactions manually
+    return sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+
+
+def init_db() -> None:
+    with closing(get_db()) as db:
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS sites (
+                   slug TEXT PRIMARY KEY,
+                   ip_hash TEXT NOT NULL,
+                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_sites_ip ON sites(ip_hash)")
+        db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('ip_salt', ?)",
+            (secrets.token_hex(16),),
+        )
+
+
+init_db()
+
+
+def normalize_ip(raw: str | None) -> str:
+    """IPv6 users often control a whole /64, so count them by that prefix."""
+    try:
+        addr = ipaddress.ip_address(raw or "")
+    except ValueError:
+        return raw or "unknown"
+    if addr.version == 6:
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
+def client_id() -> str:
+    """Salted hash of the client's IP. Raw addresses are never stored."""
+    ip = normalize_ip(request.remote_addr)
+    with closing(get_db()) as db:
+        salt = db.execute("SELECT value FROM meta WHERE key = 'ip_salt'").fetchone()[0]
+    return hashlib.sha256(f"{salt}:{ip}".encode()).hexdigest()
+
+
+def reserve_site(ip_hash: str, slug: str) -> bool:
+    """Atomically check the quota and claim the slug. False = limit reached."""
+    with closing(get_db()) as db:
+        db.execute("BEGIN IMMEDIATE")  # serializes concurrent uploads
+        try:
+            (count,) = db.execute(
+                "SELECT COUNT(*) FROM sites WHERE ip_hash = ?", (ip_hash,)
+            ).fetchone()
+            if count >= MAX_SITES_PER_IP:
+                db.execute("ROLLBACK")
+                return False
+            db.execute("INSERT INTO sites (slug, ip_hash) VALUES (?, ?)", (slug, ip_hash))
+            db.execute("COMMIT")
+            return True
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+
+
+def release_site(slug: str) -> None:
+    with closing(get_db()) as db:
+        db.execute("DELETE FROM sites WHERE slug = ?", (slug,))
+
+
+# ---------------------------------------------------------------------------
+# Site helpers
+# ---------------------------------------------------------------------------
 def make_slug(value: str) -> str:
     """Return a URL-friendly site name, never a path."""
     value = secure_filename(value.strip().lower())
@@ -34,7 +125,10 @@ def make_slug(value: str) -> str:
 
 
 def site_exists(slug: str) -> bool:
-    return (UPLOAD_FOLDER / slug).is_dir()
+    if (UPLOAD_FOLDER / slug).is_dir():
+        return True
+    with closing(get_db()) as db:
+        return db.execute("SELECT 1 FROM sites WHERE slug = ?", (slug,)).fetchone() is not None
 
 
 def unique_slug(slug: str) -> str:
@@ -207,16 +301,30 @@ def index():
             return redirect(url_for("index"))
 
         slug = unique_slug(slug)
+
+        # Enforce the per-IP quota before touching the disk.
+        try:
+            reserved = reserve_site(client_id(), slug)
+        except sqlite3.IntegrityError:
+            flash("That name was just taken. Please try again.", "error")
+            return redirect(url_for("index"))
+        if not reserved:
+            flash(
+                f"Limit reached: you can publish up to {MAX_SITES_PER_IP} websites per IP address.",
+                "error",
+            )
+            return redirect(url_for("index"))
+
         destination = UPLOAD_FOLDER / slug
-        destination.mkdir(parents=True, exist_ok=False)
         temp_zip = None
 
         try:
+            destination.mkdir(parents=True, exist_ok=False)
+
             if extension == ".html":
                 (destination / "index.html").write_bytes(uploaded.read())
             else:
                 # Store the archive outside the public site directory.
-                import tempfile
                 with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp:
                     temp_zip = Path(temp.name)
                     uploaded.save(temp.name)
@@ -224,13 +332,18 @@ def index():
                     raise ValueError("The uploaded file is not a valid ZIP archive.")
                 extract_site_zip(temp_zip, destination)
 
-            site_root = prepare_site_root(destination)
-            # If ZIP used a single wrapper folder, serve that folder directly.
+            # Make sure there's a usable index.html (root or single wrapper folder).
+            prepare_site_root(destination)
             return redirect(url_for("published", site_name=slug))
         except (ValueError, zipfile.BadZipFile, OSError) as exc:
             shutil.rmtree(destination, ignore_errors=True)
+            release_site(slug)  # failed uploads don't use up a slot
             flash(str(exc) if str(exc) else "Could not process this upload.", "error")
             return redirect(url_for("index"))
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            release_site(slug)
+            raise
         finally:
             if temp_zip:
                 temp_zip.unlink(missing_ok=True)
@@ -245,7 +358,7 @@ def published(site_name):
     if not site_dir.is_dir():
         abort(404)
     try:
-        site_root = prepare_site_root(site_dir)
+        prepare_site_root(site_dir)
     except ValueError:
         abort(404)
     site_url = request.url_root.rstrip("/") + url_for("serve_site", site_name=slug)
